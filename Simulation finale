@@ -1,0 +1,317 @@
+import pickle
+import pandas as pd
+import h3
+import random
+
+# =========================================================
+# CHARGEMENT DE LA MÉMOIRE DE LA CARTE
+# =========================================================
+
+print("Chargement de la topographie...")
+with open("memoire_chemin.pkl", "rb") as fichier:
+    carte = pickle.load(fichier)
+
+zone_depart = carte['zone_depart']
+zone_arrivee = set(carte['zone_arrivee'])   
+zone_secours = set(carte['zone_secours'])
+cellules_marchables = carte['cellules_marchables']
+distances_vers_fin = carte['distances_vers_fin']
+distances_vers_sorties_secours = carte['distances_vers_sorties_secours']
+ZONES_DANGER = carte['ZONES_DANGER']  
+DIST_MAX = carte['DIST_MAX']
+
+# =========================================================
+# PANNEAU DE CONTRÔLE (Hyperparamètres)
+# =========================================================
+
+# --- 1. Paramètres de la Foule ---
+NOMBRE_AGENTS = 1500
+FLUX_PAR_SECONDE = 11 # Nombre de personnes qui arrivent par seconde
+CAPACITE_MAX = 3
+
+# --- 2. INITIALISATION DE LA SIMULATION ---
+DENS_MAX = 4
+TEMPS_MAX = 1000
+
+# --- 3. Psychologie (Total = 100) ---
+IMPORTANCE_BUT     = 70  # % d'envie d'arriver vite à destination
+IMPORTANCE_CONFORT = 30  # % d'envie d'éviter la foule (densité)
+
+# Sécurité : on s'assure que le total fait bien 100
+total = IMPORTANCE_BUT + IMPORTANCE_CONFORT
+W_DIST = IMPORTANCE_BUT / total
+W_DENS = IMPORTANCE_CONFORT / total
+
+# =========================================================
+# PSYCHOLOGIE : JAUGE DE STRESS 
+# =========================================================
+SEUIL_PANIQUE = 100
+SEUIL_CALME = 25 # L'agent redevient calme s'il descend en dessous de ce seuil
+
+# Gains de stress (par seconde)
+GAIN_DENSITE_4 = 40
+GAIN_DENSITE_3 = 15
+GAIN_CONTAGION = 10           # Contact avec un agent paniqué
+
+# Pertes de stress (par seconde)
+PERTE_DENSITE_2 = -0.5
+PERTE_DENSITE_1 = -1
+PERTE_INACTIVITE_10S = -2 # Bonus de calme si rien ne se passe
+
+TEMPS_IDLE_REQUIS = 10 # secondes
+PROBA_ACCEPTER_FOULE = 0.6      # 1% de chance qu'un agent calme accepte de s'entasser sur une case déjà à 3
+
+# =========================================================
+# DÉFINITION DES FONCTIONS
+# =========================================================
+
+def evaluer_et_choisir(cellule_actuelle, mode_actuel, cellules_voisines, densite_locale):
+    """ Calcule le meilleur mouvement basé sur le mode actuel. Ne gère plus le stress. """
+    options = cellules_voisines + [cellule_actuelle] 
+    
+    scores = {}
+    for case in options:
+        # Si mode 0 : vise la fin. Si mode 1 : vise les secours.
+        dist_brute = distances_vers_fin.get(case, float('inf')) if mode_actuel == 0 else distances_vers_sorties_secours.get(case, float('inf'))
+        dens_brute = densite_locale.get(case, 0)
+        
+        n_dist = dist_brute / DIST_MAX
+        n_dens = dens_brute / DENS_MAX
+        
+        scores[case] = (n_dist * W_DIST) + (n_dens * W_DENS) + random.uniform(0, 0.001)
+            
+    options.sort(key=scores.get)
+
+    for meilleur_choix in options:
+        densite_choix = densite_locale.get(meilleur_choix, 0)
+        
+        if densite_choix < 3:
+            return meilleur_choix
+        elif densite_choix == 3 and mode_actuel == 1:
+            return meilleur_choix # En panique, il force le passage
+        elif densite_choix == 3 and mode_actuel == 0:
+            if random.random() < PROBA_ACCEPTER_FOULE:
+                return meilleur_choix # Calme, il hésite à rentrer dans la foule
+            
+    return cellule_actuelle
+
+# =========================================================
+# Simulation Pas-à-Pas 
+# =========================================================
+
+print("Préparation de la psychologie de la foule...")
+
+# 1. Tout le monde naît dans la "salle d'attente"
+df_agents = pd.DataFrame({
+    'agent_id': range(NOMBRE_AGENTS),
+    'cellule_actuelle': [None] * NOMBRE_AGENTS, # Pas encore sur la carte
+    'statut': 'En attente',                     # <-- NOUVEAU STATUT
+    'mode': 0,
+    'stress': 0,
+    'dernier_stress_t': 0 # On stocke le dernier moment où il a subi un stress
+
+})
+
+# La carte est totalement vide à la seconde zéro
+densite_actuelle = {}
+carnet_de_route = []
+temps = 0
+compteur_sortis = 0
+cache_voisins = {}
+
+while True:
+
+    agents_en_attente = df_agents[df_agents['statut'] == 'En attente']
+
+    # NOUVELLE SÉCURITÉ ULTRA-RAPIDE : On vérifie juste notre compteur !
+    if compteur_sortis >= NOMBRE_AGENTS or temps > TEMPS_MAX: 
+        break
+
+    # --- LE PORTIER ---
+    nombre_a_entrer = min(FLUX_PAR_SECONDE, len(agents_en_attente))
+    if nombre_a_entrer > 0:
+        # On fait la liste des cases libres UNE SEULE FOIS pour toute la seconde
+        cases_depart_libres = [c for c in zone_depart if densite_actuelle.get(c, 0) < CAPACITE_MAX]
+        
+        for row in agents_en_attente.head(nombre_a_entrer).itertuples():
+            index = row.Index # On récupère l'index avec le point
+            
+            # S'il n'y a plus aucune case dans notre liste, on arrête de faire entrer des gens
+            if not cases_depart_libres:
+                break 
+                
+            # L'agent choisit une case au hasard dans la liste
+            case_choisie = random.choice(cases_depart_libres)
+            df_agents.at[index, 'cellule_actuelle'] = case_choisie
+            df_agents.at[index, 'statut'] = 'En route'
+            df_agents.at[index, 'dernier_stress_t'] = temps
+            
+            # On calcule tout de suite la nouvelle densité de cette case
+            nouvelle_densite = densite_actuelle.get(case_choisie, 0) + 1
+            densite_actuelle[case_choisie] = nouvelle_densite
+            
+            # Si cette case vient d'atteindre sa capacité maximum (3 personnes), 
+            # on la raye de notre liste "cases_depart_libres" !
+            if nouvelle_densite >= CAPACITE_MAX:
+                cases_depart_libres.remove(case_choisie)
+
+    # On met à jour la liste des actifs car le portier vient d'en faire entrer !
+    agents_actifs = df_agents[df_agents['statut'] == 'En route']
+
+    # 1. LE RADAR : On repère toutes les cases contenant des agents paniqués à cette seconde précise
+    presence_panique = set(agents_actifs[agents_actifs['mode'] == 1]['cellule_actuelle'])
+
+    # 2. AU TOUR DES AGENTS DE JOUER
+    agents_actifs = agents_actifs.sample(frac=1)
+    # --- Le Cerveau ---
+    for row in agents_actifs.itertuples(): 
+        index = row.Index
+        agent_id = row.agent_id
+        cellule_actuelle = row.cellule_actuelle
+        stress_actuel = row.stress
+        mode_actuel = row.mode
+        t_dernier_stress = row.dernier_stress_t
+        
+        delta_stress = 0
+        a_ete_stresse_ce_tour = False
+
+        # --- 1. PSYCHOLOGIE : LA ZONE DE DANGER ---
+        if cellule_actuelle in ZONES_DANGER:
+            delta_stress = 100
+            a_ete_stresse_ce_tour = True
+
+        # --- 2. PSYCHOLOGIE : LA CONTAGION ---
+        elif cellule_actuelle in presence_panique and densite_actuelle.get(cellule_actuelle, 0) > 1:
+            delta_stress += GAIN_CONTAGION
+            a_ete_stresse_ce_tour = True
+
+        # --- 3. PSYCHOLOGIE : LA DENSITÉ ---
+        else:
+            densite = densite_actuelle.get(cellule_actuelle, 0)
+            if densite >= 4:
+                delta_stress = GAIN_DENSITE_4
+                a_ete_stresse_ce_tour = True
+            elif densite == 3:
+                delta_stress = GAIN_DENSITE_3
+                a_ete_stresse_ce_tour = True
+            elif densite == 2:
+                delta_stress = PERTE_DENSITE_2
+            elif densite == 1:
+                delta_stress = PERTE_DENSITE_1
+            
+            # --- 4. PSYCHOLOGIE : L'INACTIVITÉ ---
+            if not a_ete_stresse_ce_tour:
+                if (temps - t_dernier_stress) >= TEMPS_IDLE_REQUIS:
+                    delta_stress += PERTE_INACTIVITE_10S
+
+        # --- Fin du calcul du stress ---            
+        nouveau_stress = max(0, min(100, stress_actuel + delta_stress))
+
+        # --- 5. BASCULE DU MODE (Hystérésis) ---
+        nouveau_mode = mode_actuel
+        if nouveau_stress >= SEUIL_PANIQUE:
+            nouveau_mode = 1 
+        elif mode_actuel == 1 and nouveau_stress < SEUIL_CALME:
+            nouveau_mode = 0 
+        
+        # Mise à jour de la mémoire du stress
+        if a_ete_stresse_ce_tour:
+            df_agents.at[index, 'dernier_stress_t'] = temps
+            
+        # =======================================================
+        # LE CERVEAU (Le déplacement basé sur le nouveau mode)
+        # =======================================================
+        if cellule_actuelle not in cache_voisins:
+            cache_voisins[cellule_actuelle] = [v for v in h3.grid_ring(cellule_actuelle, 1) if v in cellules_marchables]
+        
+        voisins_valides = cache_voisins[cellule_actuelle]
+
+        nouvelle_cellule = evaluer_et_choisir(
+            cellule_actuelle=cellule_actuelle,
+            mode_actuel=nouveau_mode, # Il utilise son mode tout frais !
+            cellules_voisines=voisins_valides,
+            densite_locale=densite_actuelle
+        )
+
+        # =======================================================
+        # LA PHYSIQUE (Mise à jour des densités et statuts)
+        # =======================================================
+        if nouvelle_cellule != cellule_actuelle:
+            densite_actuelle[cellule_actuelle] -= 1
+            densite_actuelle[nouvelle_cellule] = densite_actuelle.get(nouvelle_cellule, 0) + 1
+            
+        # On sauvegarde tout dans le dataframe pour le tour suivant
+        df_agents.at[index, 'cellule_actuelle'] = nouvelle_cellule
+        df_agents.at[index, 'mode'] = nouveau_mode
+        df_agents.at[index, 'stress'] = nouveau_stress 
+
+        # Vérification des arrivées
+        if nouveau_mode == 0 and nouvelle_cellule in zone_arrivee:
+            df_agents.at[index, 'statut'] = 'Arrivé'
+            densite_actuelle[nouvelle_cellule] -= 1
+            compteur_sortis += 1
+        elif nouveau_mode == 1 and nouvelle_cellule in zone_secours:
+            df_agents.at[index, 'statut'] = 'Évacué'
+            densite_actuelle[nouvelle_cellule] -= 1
+            compteur_sortis += 1
+
+        # ENREGISTREMENT POUR KEPLER.GL
+        lat, lon = h3.cell_to_latlng(nouvelle_cellule)
+        carnet_de_route.append({
+            'agent_id': agent_id,
+            'timestamp': temps,  
+            'lat': lat,
+            'lon': lon,
+            'h3_id': nouvelle_cellule,
+            'mode': nouveau_mode,
+            'stress': nouveau_stress 
+        })
+
+    # ==========================================
+    # BARRE DE CHARGEMENT
+    # ==========================================
+    # On calcule le pourcentage de temps écoulé
+    pourcentage = (temps / TEMPS_MAX) * 100
+    
+    # Sécurité pour ne pas dépasser 100% si on atteint la limite
+    if pourcentage > 100: 
+        pourcentage = 100
+        
+    # On dessine la barre (30 caractères de long)
+    longueur_barre = 30
+    blocs_remplis = int((pourcentage / 100) * longueur_barre)
+    dessin_barre = "█" * blocs_remplis + "-" * (longueur_barre - blocs_remplis)
+    
+    # L'affichage mis à jour
+    print(f"\r⏳ Simulation : [{dessin_barre}] {pourcentage:.1f}% | Actifs: {len(agents_actifs)} | Sortis : {compteur_sortis}", end="", flush=True)
+    
+    temps += 1
+
+print()
+
+# =========================================================
+# ÉTAPE 4 : EXPORTATION "TOUT-EN-UN" POUR KEPLER.GL
+# =========================================================
+print("Fin de la simulation. Exportation des données...")
+
+df_final = pd.DataFrame(carnet_de_route)
+
+if df_final.empty:
+    print("Attention : Le tableau est vide.")
+else:
+    # 1. On calcule la densité pour chaque case à chaque instant
+    # On crée un petit tableau temporaire qui compte les agents par (h3_id, timestamp)
+    df_comptage = df_final.groupby(['h3_id', 'timestamp']).size().reset_index(name='densite_case')
+
+    # 2. On fusionne ce comptage avec notre tableau principal
+    # Maintenant, chaque ligne d'agent sait combien il y a de monde sur sa case !
+    df_final = df_final.merge(df_comptage, on=['h3_id', 'timestamp'], how='left')
+
+    # 3. L'astuce pour avoir le bouton Play (Conversion en vraies heures)
+    heure_depart = pd.to_datetime("2026-03-17 08:00:00")
+    df_final['timestamp'] = heure_depart + pd.to_timedelta(df_final['timestamp'], unit='s')
+    
+    # 4. On exporte le fichier UNIQUE
+    df_final.to_csv("simulation.csv", index=False)
+    
+    print("Succès ! Le fichier 'simulation.csv' a été généré.")
