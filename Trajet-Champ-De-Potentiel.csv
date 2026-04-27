@@ -1,0 +1,172 @@
+import pandas as pd
+import networkx as nx
+import h3
+import random
+from datetime import datetime, timedelta
+
+# =========================================================
+# ÉTAPE 1 : Charger les données et construire le Réseau
+# =========================================================
+print("1. Chargement et construction du réseau...")
+donnees_rue = pd.read_csv("plan_jaures.csv")
+
+# On ne garde que les zones où le piéton a le droit de marcher
+cellules_marchables = set(donnees_rue[donnees_rue['statut'] == 'Marchable']['h3_id'])
+
+# Création du graphe (le squelette de la rue)
+reseau_urbain = nx.Graph()
+for cellule in cellules_marchables:
+    reseau_urbain.add_node(cellule)
+
+for cellule in cellules_marchables:
+    for voisin in h3.grid_ring(cellule, 1):
+        if voisin in cellules_marchables:
+            reseau_urbain.add_edge(cellule, voisin)
+
+composants_connectes = list(nx.connected_components(reseau_urbain))
+zone_principale = max(composants_connectes, key=len)
+reseau_final = reseau_urbain.subgraph(zone_principale).copy()
+
+# =========================================================
+# ÉTAPE 2 : Identifier les ZONES de départ (Ouest) et d'arrivée (Est)
+# =========================================================
+print("2. Identification des zones d'extrémités...")
+liste_coordonnees = []
+for cellule in reseau_final.nodes():
+    lat, lon = h3.cell_to_latlng(cellule)
+    liste_coordonnees.append((cellule, lat, lon))
+
+# On trie de l'Ouest vers l'Est
+liste_coordonnees.sort(key=lambda p: p[2])
+
+# NOUVEAUTÉ : On ne prend plus 1 seule case, mais une liste des 50 cases aux extrémités !
+zone_depart = [p[0] for p in liste_coordonnees[:200]]  # Les 50 plus à l'Ouest
+zone_arrivee = [p[0] for p in liste_coordonnees[-50:]] # Les 50 plus à l'Est
+
+print(f" -> Zone de départ (Ouest) : {len(zone_depart)} cellules possibles")
+print(f" -> Zone d'arrivée (Est) : {len(zone_arrivee)} cellules possibles")
+
+# =========================================================
+# L'ASTUCE PRO : Le Champ de Potentiel (L'odeur de l'arrivée)
+# =========================================================
+print("-> Création du champ d'attraction géant...")
+# On crée un point d'arrivée global invisible
+reseau_final.add_node("AIMANT_FINAL")
+for cellule in zone_arrivee:
+    reseau_final.add_edge(cellule, "AIMANT_FINAL")
+
+# L'ordinateur calcule UNE SEULE FOIS la distance de toutes les cases vers cet aimant
+# C'est instantané et ça remplace les 1000 calculs de GPS !
+distances_vers_fin = nx.shortest_path_length(reseau_final, target="AIMANT_FINAL")
+reseau_final.remove_node("AIMANT_FINAL") # On nettoie la carte
+
+# =========================================================
+# ÉTAPE 3 : Simulation Pas-à-Pas (Intelligence en Essaim)
+# =========================================================
+NOMBRE_AGENTS = 1000
+print(f"3. Lâcher de {NOMBRE_AGENTS} agents en mode 'Système Multi-Agents'...")
+
+# 1. On place tous les agents sur la ligne de départ en même temps
+df_agents = pd.DataFrame({
+    'agent_id': range(NOMBRE_AGENTS),
+    'cellule_actuelle': [random.choice(zone_depart) for _ in range(NOMBRE_AGENTS)],
+    'statut': 'En route'
+})
+
+carnet_de_route = []
+temps_actuel = datetime(2026, 3, 17, 8, 0, 0)
+seconde_ecoulee = 0
+CAPACITE_MAX = 3
+
+# 2. LA BOUCLE DU TEMPS (On avance seconde par seconde)
+# Tant qu'il reste au moins 1 agent "En route", la simulation continue
+while (df_agents['statut'] == 'En route').any():
+    seconde_ecoulee += 1
+    temps_actuel += timedelta(seconds=1)
+
+    # On isole les agents qui n'ont pas encore fini leur trajet
+    masque_actifs = df_agents['statut'] == 'En route'
+    agents_actifs = df_agents[masque_actifs]
+   
+    # On photographie la densité actuelle (Qui est sur quelle case MAINTENANT ?)
+    densite_actuelle = agents_actifs['cellule_actuelle'].value_counts().to_dict()
+
+    nouvelles_positions = []
+    nouveaux_statuts = []
+
+    # 3. Chaque agent regarde autour de lui à l'instant T
+    for index, row in agents_actifs.iterrows():
+        cellule = row['cellule_actuelle']
+       
+        # Est-il arrivé sur la zone de fin ?
+        if cellule in zone_arrivee:
+            nouvelles_positions.append(cellule)
+            nouveaux_statuts.append('Arrivé')
+            continue
+           
+        # Sinon, il regarde les 6 cases collées à lui
+        voisins = list(reseau_final.neighbors(cellule))
+       
+        # Il filtre pour ne garder QUE les cases qui le rapprochent de l'arrivée
+        distance_actuelle = distances_vers_fin.get(cellule, 9999)
+        voisins_vers_but = [v for v in voisins if distances_vers_fin.get(v, 9999) < distance_actuelle]
+       
+        if not voisins_vers_but:
+            # S'il est coincé dans un coin, il attend sur place
+            nouvelles_positions.append(cellule)
+            nouveaux_statuts.append('En route')
+            continue
+
+        # L'INTELLIGENCE : Il trie ces bonnes cases par DENSITÉ (de la plus vide à la plus pleine)
+        random.shuffle(voisins_vers_but) # Hasard en cas d'égalité pour éviter les files indiennes
+        voisins_vers_but.sort(key=lambda v: densite_actuelle.get(v, 0))
+       
+        meilleur_voisin = voisins_vers_but[0]
+
+        # Si même la case la plus vide est déjà pleine (3 agents), il s'arrête et attend !
+        if densite_actuelle.get(meilleur_voisin, 0) >= CAPACITE_MAX:
+            nouvelles_positions.append(cellule)
+        else:
+            # La voie est libre, il fait un pas en avant !
+            nouvelles_positions.append(meilleur_voisin)
+            # On met à jour la densité virtuelle pour que l'agent suivant sache qu'il y a quelqu'un ici
+            densite_actuelle[meilleur_voisin] = densite_actuelle.get(meilleur_voisin, 0) + 1
+            densite_actuelle[cellule] -= 1
+           
+        nouveaux_statuts.append('En route')
+
+    # 4. On met à jour la carte globale pour la seconde suivante
+    df_agents.loc[masque_actifs, 'cellule_actuelle'] = nouvelles_positions
+    df_agents.loc[masque_actifs, 'statut'] = nouveaux_statuts
+
+    # 5. On enregistre le mouvement dans le CSV pour Kepler
+    for _, row in df_agents[masque_actifs].iterrows():
+        carnet_de_route.append({
+            "agent_id": row['agent_id'],
+            "h3_id": nouvelles_positions.pop(0),
+            "timestamp": temps_actuel.strftime("%Y-%m-%d %H:%M:%S")
+        })
+
+    # Affichage de la progression
+    if seconde_ecoulee % 10 == 0:
+        restants = len(df_agents[df_agents['statut'] == 'En route'])
+        print(f" -> Seconde {seconde_ecoulee} écoulée : {restants} agents encore en mouvement...")
+       
+    # Sécurité anti-boucle infinie si la rue est totalement bloquée
+    if seconde_ecoulee > 1000:
+        print("Arrêt de sécurité : Évacuation trop longue.")
+        break
+
+# =========================================================
+# ÉTAPE 4 : Calcul de la densité et Exportation
+# =========================================================
+print("4. Calcul des couleurs et sauvegarde du fichier...")
+df_brut = pd.DataFrame(carnet_de_route)
+
+# LA MAGIE PANDAS : On compte les agents par case et par seconde !
+df_densite = df_brut.groupby(['h3_id', 'timestamp']).size().reset_index(name='nombre_agents')
+
+nom_fichier = "simulation_foule_jean_jaures.csv"
+df_densite.to_csv(nom_fichier, index=False)
+
+print(f"BINGO ! Le fichier '{nom_fichier}' a bien été créé avec la densité.")
