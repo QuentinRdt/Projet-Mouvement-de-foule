@@ -1,0 +1,304 @@
+import pandas as pd
+import networkx as nx
+import h3
+import random
+from datetime import datetime, timedelta
+
+# ÉTAPE 1 : Charger les données et construire le Réseau
+
+print("1. Chargement et construction du réseau...")
+donnees_rue = pd.read_csv("plan_jaures.csv")
+
+# On ne garde que les zones où le piéton a le droit de marcher
+cellules_marchables = set(donnees_rue[donnees_rue['statut'] == 'Marchable']['h3_id'])
+
+# Création du graphe (le squelette de la rue)
+reseau_urbain = nx.Graph()
+for cellule in cellules_marchables:
+    reseau_urbain.add_node(cellule)
+
+for cellule in cellules_marchables:
+    for voisin in h3.grid_ring(cellule, 1):
+        if voisin in cellules_marchables:
+            reseau_urbain.add_edge(cellule, voisin)
+
+composants_connectes = list(nx.connected_components(reseau_urbain))
+zone_principale = max(composants_connectes, key=len)
+reseau_final = reseau_urbain.subgraph(zone_principale).copy()
+
+
+# ÉTAPE 2 : Identifier les ZONES de départ (Ouest) et d'arrivée (Est)
+
+
+liste_coordonnees = []
+for cellule in reseau_final.nodes():
+    lat, lon = h3.cell_to_latlng(cellule)
+    liste_coordonnees.append((cellule, lat, lon))
+
+# On trie de l'Ouest vers l'Est
+liste_coordonnees.sort(key=lambda p: p[2])
+
+# NOUVEAUTÉ : On ne prend plus 1 seule case, mais une liste des 50 cases aux extrémités !
+zone_depart = [p[0] for p in liste_coordonnees[:200]]  # Les 50 plus à l'Ouest
+zone_arrivee = [p[0] for p in liste_coordonnees[-50:]] # Les 50 plus à l'Est
+
+print(f" -> Zone de départ (Ouest) : {len(zone_depart)} cellules possibles")
+print(f" -> Zone d'arrivée (Est) : {len(zone_arrivee)} cellules possibles")
+
+# =========================================================
+# ÉTAPE 2 : LE CERVEAU GLOBAL (Les Champs de Potentiel)
+# =========================================================
+print("2. Calcul des champs de potentiel (Précalculs)...")
+
+# ---------------------------------------------------------
+# AIMANT N°1 : Le trajet normal (Mode 0 - Calme)
+# ---------------------------------------------------------
+reseau_final.add_node("AIMANT_FINAL")
+for cellule in zone_arrivee:
+    reseau_final.add_edge(cellule, "AIMANT_FINAL")
+
+distances_vers_fin = nx.shortest_path_length(reseau_final, target="AIMANT_FINAL")
+reseau_final.remove_node("AIMANT_FINAL")
+
+
+# ---------------------------------------------------------
+# AIMANT N°2 : Le trajet de fuite (Mode 1 - Panique)
+# ---------------------------------------------------------
+print("   -> Détection automatique des sorties de secours...")
+zone_secours = []
+
+for cellule in reseau_final.nodes():
+    # On exclut le départ et l'arrivée
+    if cellule not in zone_depart and cellule not in zone_arrivee:
+        voisins = list(reseau_final.neighbors(cellule))
+        # Si moins de 6 voisins, c'est une bordure / sortie
+        if len(voisins) < 6:
+            zone_secours.append(cellule)
+
+reseau_final.add_node("AIMANT_SECOURS")
+for cellule in zone_secours:
+    reseau_final.add_edge(cellule, "AIMANT_SECOURS")
+
+# Le nouveau dictionnaire de survie :
+distances_vers_sorties_secours = nx.shortest_path_length(reseau_final, target="AIMANT_SECOURS")
+reseau_final.remove_node("AIMANT_SECOURS")
+
+print(f"   -> {len(zone_secours)} cellules de secours détectées et cartographiées !")
+
+# (Et ensuite, votre script continue normalement avec l'ÉTAPE 3 : La boucle de simulation...)
+
+
+# ÉTAPE 3 : Simulation Pas-à-Pas
+print("3. Préparation de la psychologie de la foule...")
+
+# --- Paramètres de la Fonction d'Évaluation ---
+POIDS_DISTANCE = 1.0    # L'envie d'avancer vers le but
+POIDS_DENSITE = 2.0     # L'envie d'éviter les autres (priorité au confort)
+POIDS_RECUL = 3.0       # La forte pénalité si l'agent doit faire un pas en arrière
+PROBA_CONTAGION = 0.55  # 15% de chance de paniquer si on touche un agent en panique
+
+NOMBRE_AGENTS = 1000
+FLUX_PAR_SECONDE = 15 # Nombre de personnes qui arrivent par seconde
+
+# 1. Tout le monde naît dans la "salle d'attente"
+df_agents = pd.DataFrame({
+    'agent_id': range(NOMBRE_AGENTS),
+    'cellule_actuelle': [None] * NOMBRE_AGENTS, # Pas encore sur la carte
+    'statut': 'En attente',                     # <-- NOUVEAU STATUT
+    'mode': 0
+})
+
+# La carte est totalement vide à la seconde zéro
+densite_actuelle = {}
+carnet_de_route = []
+temps = 0
+
+CAPACITE_MAX = 3
+
+def evaluer_et_choisir(cellule_actuelle, mode_actuel, cellules_voisines, presence_panique, densite_locale):
+    """
+    Évalue les 7 cases possibles et renvoie le meilleur choix et le nouveau mode.
+    """
+    nouveau_mode = mode_actuel
+    options = cellules_voisines + [cellule_actuelle] # Les 7 cases !
+   
+    # --- 1. GESTION DE LA CONTAGION ---
+    if mode_actuel == 0:
+        # Si on est calme, on regarde s'il y a de la panique sur nos 7 cases
+        for case in options:
+            if case in presence_panique:
+                # Contagion ! On lance les dés
+                if random.random() < PROBA_CONTAGION:
+                    nouveau_mode = 1
+                    break # L'agent a paniqué, on arrête de vérifier
+   
+    # --- 2. ÉVALUATION DES 7 CASES ---
+    scores = {}
+    for case in options:
+        # A. Choix du bon aimant (Calme vs Panique)
+        if nouveau_mode == 0:
+            distance_case = distances_vers_fin.get(case, 999)
+            distance_origine = distances_vers_fin.get(cellule_actuelle, 999)
+        else:
+            distance_case = distances_vers_sorties_secours.get(case, 999)
+            distance_origine = distances_vers_sorties_secours.get(cellule_actuelle, 999)
+           
+        # B. L'encombrement de la case
+        densite = densite_locale.get(case, 0)
+       
+        # C. Pénalité si on recule
+        penalite = 0
+        if distance_case > distance_origine:
+            # En mode panique, on hésite moins à reculer pour fuir
+            penalite = POIDS_RECUL if nouveau_mode == 0 else (POIDS_RECUL / 2)
+           
+        # CALCUL DU SCORE (Le plus petit est le meilleur)
+        scores[case] = (distance_case * POIDS_DISTANCE) + (densite * POIDS_DENSITE) + penalite
+
+    # On trie les 7 cases de la meilleure (plus petit score) à la pire
+    options_triees = sorted(scores.keys(), key=lambda c: scores[c])
+
+    # --- 3. CHOIX FINAL ET SURVIE ---
+    for meilleur_choix in options_triees:
+        densite_choix = densite_locale.get(meilleur_choix, 0)
+       
+        # Cas 1 : La voie est libre (moins de 3 personnes), c'est parfait
+        if densite_choix < 3:
+            return meilleur_choix, nouveau_mode
+           
+        # Cas 2 : L'instinct de survie extrême demandé par le prof !
+        # On est en mode panique (1), la case a déjà 3 personnes, mais on force le passage (4)
+        elif densite_choix == 3 and nouveau_mode == 1:
+            return meilleur_choix, nouveau_mode
+           
+    # Cas 3 : Tout est bloqué (ou l'agent est calme et refuse d'être 4 sur une case)
+    return cellule_actuelle, nouveau_mode
+
+# 2. LA BOUCLE DU TEMPS (On avance seconde par seconde)
+# Tant qu'il reste au moins 1 agent "En route", la simulation continue
+densite_actuelle = df_agents['cellule_actuelle'].value_counts().to_dict()
+temps = 0
+df_agents.loc[0, 'mode'] = 1
+
+while True:
+    agents_en_attente = df_agents[df_agents['statut'] == 'En attente']
+    agents_actifs = df_agents[df_agents['statut'] == 'En route']
+   
+    # NOUVELLE SÉCURITÉ : On s'arrête s'il n'y a plus personne en route ET plus personne en attente
+    if (agents_actifs.empty and agents_en_attente.empty) or temps > 200:
+        break
+       
+    print(f"Seconde {temps} - Agents sur la carte : {len(agents_actifs)} | En attente : {len(agents_en_attente)}")
+   
+    # ==========================================
+    # 🚪 LE PORTIER (Faire entrer les nouveaux)
+    # ==========================================
+    nombre_a_entrer = min(FLUX_PAR_SECONDE, len(agents_en_attente))
+    if nombre_a_entrer > 0:
+        candidats = agents_en_attente.head(nombre_a_entrer)
+        for index, row in candidats.iterrows():
+            # Le portier cherche les cases de départ où il y a moins de 3 personnes
+            cases_depart_libres = [c for c in zone_depart if densite_actuelle.get(c, 0) < CAPACITE_MAX]
+           
+            if cases_depart_libres:
+                case_choisie = random.choice(cases_depart_libres)
+                df_agents.at[index, 'cellule_actuelle'] = case_choisie
+                df_agents.at[index, 'statut'] = 'En route'
+                densite_actuelle[case_choisie] = densite_actuelle.get(case_choisie, 0) + 1
+            else:
+                break # La ligne de départ est pleine, les autres attendront la seconde prochaine !
+
+    # On met à jour la liste des actifs car le portier vient d'en faire entrer !
+    agents_actifs = df_agents[df_agents['statut'] == 'En route']
+   
+    # 1. LE RADAR : On repère toutes les cases contenant des agents paniqués à cette seconde précise
+    agents_paniques = df_agents[(df_agents['statut'] == 'En route') & (df_agents['mode'] == 1)]
+    presence_panique = set(agents_paniques['cellule_actuelle'])
+
+    # 2. AU TOUR DES AGENTS DE JOUER
+    for index, row in agents_actifs.iterrows():
+        agent_id = row['agent_id']
+        cellule_actuelle = row['cellule_actuelle']
+        mode_actuel = row['mode']
+       
+        # On regarde les 6 voisins
+        voisins = list(h3.grid_ring(cellule_actuelle, 1))
+        # On ne garde que ceux qui sont sur le trottoir (le NavMesh)
+        voisins_valides = [v for v in voisins if v in cellules_marchables]
+
+        # ==========================================
+        # 🧠 LE CERVEAU PREND SA DÉCISION ICI
+        # ==========================================
+        nouvelle_cellule, nouveau_mode = evaluer_et_choisir(
+            cellule_actuelle=cellule_actuelle,
+            mode_actuel=mode_actuel,
+            cellules_voisines=voisins_valides,
+            presence_panique=presence_panique,
+            densite_locale=densite_actuelle
+        )
+
+        # 3. MISE À JOUR DE LA PHYSIQUE (La Densité)
+        if nouvelle_cellule != cellule_actuelle:
+            densite_actuelle[cellule_actuelle] -= 1
+            densite_actuelle[nouvelle_cellule] = densite_actuelle.get(nouvelle_cellule, 0) + 1
+           
+        # Si cet agent vient de paniquer, il devient contagieux pour les suivants de cette seconde !
+        if nouveau_mode == 1:
+            presence_panique.add(nouvelle_cellule)
+
+        # 4. MISE À JOUR DE LA BASE DE DONNÉES PANDAS
+        df_agents.at[index, 'cellule_actuelle'] = nouvelle_cellule
+        df_agents.at[index, 'mode'] = nouveau_mode
+
+        # 5. CONDITIONS DE VICTOIRE OU DE FUITE
+        # Cas A : L'agent est calme et arrive à destination à l'Est
+        if nouveau_mode == 0 and nouvelle_cellule in zone_arrivee:
+            df_agents.at[index, 'statut'] = 'Arrivé'
+            densite_actuelle[nouvelle_cellule] -= 1
+           
+        # Cas B : L'agent panique et a atteint une sortie de secours !
+        elif nouveau_mode == 1 and nouvelle_cellule in zone_secours:
+            df_agents.at[index, 'statut'] = 'Évacué'
+            densite_actuelle[nouvelle_cellule] -= 1
+
+        # 6. ENREGISTREMENT POUR KEPLER.GL
+        lat, lon = h3.cell_to_latlng(nouvelle_cellule)
+       
+        # 1. On range dans le bon tiroir : carnet_de_route
+        carnet_de_route.append({
+            'agent_id': agent_id,
+            'timestamp': temps,  # 2. On utilise la bonne clé : 'timestamp' (au lieu de 'temps')
+            'lat': lat,
+            'lon': lon,
+            'h3_id': nouvelle_cellule,
+            'mode': nouveau_mode
+        })
+
+    temps += 1
+
+# =========================================================
+# ÉTAPE 4 : EXPORTATION "TOUT-EN-UN" POUR KEPLER.GL
+# =========================================================
+print("4. Fin de la simulation. Exportation des données...")
+
+df_final = pd.DataFrame(carnet_de_route)
+
+if df_final.empty:
+    print("⚠️ Attention : Le tableau est vide.")
+else:
+    # 1. On calcule la densité pour chaque case à chaque instant
+    # On crée un petit tableau temporaire qui compte les agents par (h3_id, timestamp)
+    df_comptage = df_final.groupby(['h3_id', 'timestamp']).size().reset_index(name='densite_case')
+
+    # 2. On fusionne ce comptage avec notre tableau principal
+    # Maintenant, chaque ligne d'agent sait combien il y a de monde sur sa case !
+    df_final = df_final.merge(df_comptage, on=['h3_id', 'timestamp'], how='left')
+
+    # 3. L'astuce pour avoir le bouton Play (Conversion en vraies heures)
+    heure_depart = pd.to_datetime("2026-03-17 08:00:00")
+    df_final['timestamp'] = heure_depart + pd.to_timedelta(df_final['timestamp'], unit='s')
+   
+    # 4. On exporte le fichier UNIQUE
+    df_final.to_csv("simulation_complete.csv", index=False)
+   
+    print("✅ Succès ! Le fichier 'simulation_complete.csv' contient Trajectoires + Densité.")
